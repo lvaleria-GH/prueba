@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Geoportal Mendoza - Población y Salud</title>
+    
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    
+    <script src="https://unpkg.com/simple-statistics@7.8.3/dist/simple-statistics.min.js"></script>
+    
+    <style>
+        body { margin: 0; padding: 0; font-family: Arial, sans-serif; }
+        #map { height: 100vh; width: 100vw; }
+        
+        /* Estilos unificados para las leyendas del mapa */
+        .info.legend {
+            background: white; 
+            padding: 12px; 
+            border-radius: 8px;
+            line-height: 20px; 
+            box-shadow: 0 0 15px rgba(0,0,0,0.2);
+            max-width: 260px;
+            color: #333;
+        }
+        .info.legend h4 { 
+            margin: 0 0 8px; 
+            font-size: 14px;
+            border-bottom: 1px solid #ccc;
+            padding-bottom: 4px;
+        }
+        .legend-item { 
+            display: flex; 
+            align-items: center; 
+            margin-bottom: 5px; 
+            font-size: 12px;
+        }
+        .color-box { 
+            width: 18px; 
+            height: 18px; 
+            margin-right: 8px; 
+            opacity: 0.8; 
+            border: 1px solid #fff;
+        }
+        .circle-marker { 
+            width: 12px; 
+            height: 12px; 
+            border-radius: 50%; 
+            margin-right: 10px; 
+            display: inline-block; 
+            border: 1px solid #fff;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="map"></div>
+
+    <script>
+        // ==========================================
+        // 1. INICIALIZACIÓN DEL MAPA Y CAPAS BASE
+        // ==========================================
+        const map = L.map('map').setView([-34.6, -68.5], 7);
+
+        // Mapa Base Claro
+        const basemap = L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+            attribution: '&copy; OpenStreetMap &copy; CARTO'
+        }).addTo(map);
+
+        // Forzamos renderizadores SVG independientes para garantizar el orden de apilado (Z-Index)
+        const rendererDeptos = L.svg({ padding: 0.5 });
+        const rendererSalud = L.svg({ padding: 0.5 });
+
+        // Inicializamos los grupos lógicos vacíos y los añadimos al mapa
+        const capaGroupDeptos = L.layerGroup().addTo(map);
+        const capaGroupSalud = L.layerGroup().addTo(map);
+
+        let geojsonDeptos;
+        let geojsonSalud;
+
+        // ==========================================
+        // 2. FUNCIONES DE COLORES
+        // ==========================================
+        function getColorDepto(v, breaks) {
+            return v <= breaks[1] ? '#fef0d9' :
+                   v <= breaks[2] ? '#fdcc8a' :
+                   v <= breaks[3] ? '#fc8d59' :
+                   v <= breaks[4] ? '#e34a33' :
+                                    '#b30000';
+        }
+
+        function getColorSalud(tipo) {
+            if (!tipo) return '#95a5a6';
+            const t = tipo.toUpperCase().trim();
+            
+            if (t.includes('HOSPITAL')) return '#e74c3c'; // Rojo
+            if (t === 'CAPS')           return '#3498db'; // Azul
+            if (t === 'CIC')            return '#2ecc71'; // Verde
+            return '#95a5a6';                             // Gris (Otros/Postas)
+        }
+
+        // ==========================================
+        // 3. CARGA SECUENCIAL DE DATOS (PROMISE.ALL)
+        // ==========================================
+        // Forzamos a que se descarguen ambos archivos antes de empezar a dibujar ninguno
+        Promise.all([
+            fetch('depto_mendoza.geojson').then(res => res.json()),
+            fetch('centros_salud.geojson').then(res => res.json())
+        ])
+        .then(([dataDeptos, dataSalud]) => {
+            
+            // --- A. PROCESAR Y DIBUJAR DEPARTAMENTOS PRIMERO ---
+            const valoresPoblacion = dataDeptos.features.map(f => f.properties.poblacion || 0);
+            const clusters = ss.ckmeans(valoresPoblacion, 5);
+            const breaks = [
+                Math.min(...valoresPoblacion),
+                clusters[0][clusters[0].length - 1],
+                clusters[1][clusters[1].length - 1],
+                clusters[2][clusters[2].length - 1],
+                clusters[3][clusters[3].length - 1],
+                clusters[4][clusters[4].length - 1]
+            ];
+
+            geojsonDeptos = L.geoJSON(dataDeptos, {
+                renderer: rendererDeptos, // Asignamos renderizador de fondo
+                style: function(feature) {
+                    return {
+                        fillColor: getColorDepto(feature.properties.poblacion || 0, breaks),
+                        weight: 1.5, 
+                        color: '#ffffff', 
+                        fillOpacity: 0.7
+                    };
+                },
+                onEachFeature: function(feature, layer) {
+                    const nombre = feature.properties.NAM || feature.properties.departamento || "Desconocido";
+                    const pob = (feature.properties.poblacion || 0).toLocaleString('es-AR');
+                    layer.bindPopup(`<b>Departamento:</b> ${nombre}<br><b>Población:</b> ${pob} hab.`);
+                    
+                    layer.on({
+                        mouseover: e => { e.target.setStyle({ weight: 3, color: '#666', fillOpacity: 0.8 }); },
+                        mouseout: e => { geojsonDeptos.resetStyle(e.target); }
+                    });
+                }
+            });
+            capaGroupDeptos.addLayer(geojsonDeptos);
+            crearLeyendaDeptos(breaks);
+
+
+            // --- B. DIBUJAR CENTROS DE SALUD SEGUNDO (QUEDAN ARRIBA SI O SI) ---
+            geojsonSalud = L.geoJSON(dataSalud, {
+                renderer: rendererSalud, // Asignamos renderizador de frente
+                pointToLayer: function (feature, latlng) {
+                    const tipoCentro = feature.properties.tipo || 'Otros';
+                    return L.circleMarker(latlng, {
+                        radius: 6,
+                        fillColor: getColorSalud(tipoCentro),
+                        color: '#ffffff',
+                        weight: 1.5,
+                        opacity: 1,
+                        fillOpacity: 0.9
+                    });
+                },
+                onEachFeature: function (feature, layer) {
+                    const nombreEstablecimiento = feature.properties.nombre || "Sin nombre";
+                    const tipoCentro = feature.properties.tipo || "No especificado";
+                    const departamento = feature.properties.departamen || "";
+                    layer.bindPopup(`<b>Establecimiento:</b> ${nombreEstablecimiento}<br><b>Tipo:</b> ${tipoCentro}<br><b>Dpto:</b> ${departamento}`);
+                }
+            });
+            capaGroupSalud.addLayer(geojsonSalud);
+            
+            // Forzado explícito de orden en el árbol DOM del navegador
+            geojsonSalud.bringToFront();
+            crearLeyendaSalud();
+
+            // --- C. INICIALIZAR EL CONTROL DE CAPAS ---
+            const overlays = {
+                "Población (Departamentos)": capaGroupDeptos,
+                "Centros de Salud (Puntos)": capaGroupSalud
+            };
+            L.control.layers({}, overlays, { collapsed: false }).addTo(map);
+
+            // Re-forzar orden si el usuario apaga y prende capas en la interfaz
+            map.on('overlayadd', function() {
+                geojsonSalud.bringToFront();
+            });
+        })
+        .catch(err => console.error("Error procesando los datos geográficos:", err));
+
+
+        // ==========================================
+        // 4. FUNCIONES CONCRETAS DE LEYENDAS Visuales
+        // ==========================================
+        function crearLeyendaDeptos(breaks) {
+            const legend = L.control({ position: 'bottomright' });
+            legend.onAdd = function () {
+                const div = L.DomUtil.create('div', 'info legend');
+                div.innerHTML = '<h4>Población por Depto. (Jenks)</h4>';
+                for (let i = 0; i < breaks.length - 1; i++) {
+                    const desde = Math.round(breaks[i]).toLocaleString('es-AR');
+                    const hasta = Math.round(breaks[i + 1]).toLocaleString('es-AR');
+                    div.innerHTML += `
+                        <div class="legend-item">
+                            <div class="color-box" style="background:${getColorDepto(breaks[i+1], breaks)}"></div>
+                            <span>${desde} &ndash; ${hasta} hab.</span>
+                        </div>`;
+                }
+                return div;
+            };
+            legend.addTo(map);
+        }
+
+        function crearLeyendaSalud() {
+            const legendSalud = L.control({ position: 'bottomleft' });
+            legendSalud.onAdd = function () {
+                const div = L.DomUtil.create('div', 'info legend');
+                div.innerHTML = '<h4>Estructura Sanitaria</h4>';
+                
+                const categorias = [
+                    { nombre: 'Hospital', color: '#e74c3c' },
+                    { nombre: 'CAPS', color: '#3498db' },
+                    { font_name: 'CIC', nombre: 'CIC', color: '#2ecc71' },
+                    { nombre: 'Otros / Postas', color: '#95a5a6' }
+                ];
+                
+                categorias.forEach(cat => {
+                    div.innerHTML += `
+                        <div class="legend-item">
+                            <span class="circle-marker" style="background:${cat.color}"></span>
+                            <span>${cat.nombre}</span>
+                        </div>`;
+                });
+                return div;
+            };
+            legendSalud.addTo(map);
+        }
+    </script>
+</body>
+</html>
